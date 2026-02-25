@@ -266,21 +266,57 @@ async function fetchPositionSnapshot(provider) {
   };
 }
 
-// =============== 5) main：只输出必要信息 ===============
+// =============== 5) main：美化终端输出 ===============
 
 async function main() {
   const provider = new JsonRpcProvider(HYPER_EVM_RPC);
+  const blockNumber = await provider.getBlockNumber();
+  const now = new Date().toISOString();
+
   const snap = await fetchPositionSnapshot(provider);
 
   if (snap.mismatches.length) {
     console.log(`WARN: MarketParams mismatch: ${snap.mismatches.join(", ")} (池子可能变更/升级了)`);
   }
 
-  console.log("Felix 头寸监控（HyperEVM）");
-  console.log(`Collateral: ${snap.collateralAmountStr} ${snap.collatSymbol}  (~$${snap.collateralUsdStr})`);
-  console.log(`Debt      : ${snap.debtAmountStr} ${snap.loanSymbol}  (~$${snap.debtUsdStr})`);
-  console.log(`Borrow APY: ${toPctString(snap.borrowApy)}  (APR ${toPctString(snap.borrowApr)})`);
-  console.log(`Util      : ${toPctString(snap.utilization)}   HF ${Number.isFinite(snap.healthFactor) ? snap.healthFactor.toFixed(4) : "∞"}`);
+  const utilizationPct = toPctString(snap.utilization);
+  const lltvPct = toPctString(Number(snap.lltv) / 1e18);
+  const hfStr = Number.isFinite(snap.healthFactor) ? snap.healthFactor.toFixed(4) : "∞";
+
+  // 简单风险评估（仅做主观参考）
+  let riskLevel = "✅ 风险较低";
+  if (snap.utilization > 0.75 || (Number.isFinite(snap.healthFactor) && snap.healthFactor < 1.3)) {
+    riskLevel = "⚠️ 风险偏高，建议减仓或补充抵押";
+  } else if (snap.utilization > 0.6 || (Number.isFinite(snap.healthFactor) && snap.healthFactor < 1.6)) {
+    riskLevel = "🟡 风险中等，注意价格波动";
+  }
+
+  console.log(`[INFO ] ${now} - Felix / HyperEVM 仓位监控脚本启动`);
+  console.log(`[INFO ] ${now} - 使用 RPC: ${HYPER_EVM_RPC}`);
+  console.log(`[INFO ] ${now} - 钱包地址: ${USER_ADDRESS}`);
+  console.log(`[INFO ] ${now} - Pool ID : ${FELIX_POOL_ID.slice(0, 12)}...`);
+  console.log(
+    `[INFO ] ${now} - 已连接到 HyperEVM，当前区块高度: ${blockNumber.toString()}`
+  );
+
+  console.log("");
+  console.log("==============================================");
+  console.log(" Felix / HyperEVM 抵押借款仓位监控结果");
+  console.log("==============================================");
+  console.log(` 抵押品数量       : ${snap.collateralAmountStr} ${snap.collatSymbol}`);
+  console.log(` 抵押品总价值 USD : $${snap.collateralUsdStr}`);
+  console.log(` 借款总价值 USD   : $${snap.debtUsdStr}`);
+  console.log(` 仓位利用率       : ${utilizationPct}`);
+  console.log(` LTV（协议上限）  : ${lltvPct}`);
+  console.log(` 健康因子         : ${hfStr}`);
+  console.log(
+    ` 借款 APY (估算)  : ${toPctString(snap.borrowApy)}  (APR ${toPctString(
+      snap.borrowApr
+    )})`
+  );
+  console.log("----------------------------------------------");
+  console.log(` 风险评估         : ${riskLevel}`);
+  console.log("==============================================");
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
