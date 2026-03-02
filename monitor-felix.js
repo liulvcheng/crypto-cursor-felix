@@ -14,6 +14,7 @@
 // - 价格与金额全部使用链上合约数据计算，不依赖网页抓包。
 
 import { JsonRpcProvider, Contract, formatUnits } from "ethers";
+import fetch from "node-fetch";
 
 // =============== 1) 固定配置（你这条池子已确认） ===============
 
@@ -266,7 +267,46 @@ async function fetchPositionSnapshot(provider) {
   };
 }
 
-// =============== 5) main：美化终端输出 ===============
+// =============== 5) Telegram 消息发送工具 ===============
+
+async function sendTelegramMessage(text) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+
+  if (!token || !chatId) {
+    console.warn(
+      "[WARN ] 未配置 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID，跳过 Telegram 推送"
+    );
+    return;
+  }
+
+  const url = `https://api.telegram.org/bot${token}/sendMessage`;
+
+  const body = {
+    chat_id: chatId,
+    text,
+    parse_mode: "Markdown",
+  };
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    console.warn(
+      `[WARN ] Telegram 发送失败: ${res.status} ${res.statusText} ${text}`
+    );
+  } else {
+    console.log("[INFO ] 已发送监控结果到 Telegram");
+  }
+}
+
+// =============== 6) main：美化终端输出 + Telegram 推送 ===============
 
 async function main() {
   const provider = new JsonRpcProvider(HYPER_EVM_RPC);
@@ -291,6 +331,7 @@ async function main() {
     riskLevel = "🟡 风险中等，注意价格波动";
   }
 
+  // 终端输出
   console.log(`[INFO ] ${now} - Felix / HyperEVM 仓位监控脚本启动`);
   console.log(`[INFO ] ${now} - 使用 RPC: ${HYPER_EVM_RPC}`);
   console.log(`[INFO ] ${now} - 钱包地址: ${USER_ADDRESS}`);
@@ -317,6 +358,33 @@ async function main() {
   console.log("----------------------------------------------");
   console.log(` 风险评估         : ${riskLevel}`);
   console.log("==============================================");
+
+  // Telegram 文本（简洁版，多行）
+  const shortAddress =
+    USER_ADDRESS.slice(0, 6) + "..." + USER_ADDRESS.slice(-4);
+
+  const lines = [
+    "*Felix / HyperEVM 抵押借款仓位监控*",
+    "",
+    `时间: \`${now}\``,
+    `钱包: \`${shortAddress}\``,
+    "",
+    `抵押品: ${snap.collateralAmountStr} ${snap.collatSymbol} ($${snap.collateralUsdStr})`,
+    `借款:   $${snap.debtUsdStr} ${snap.loanSymbol}`,
+    "",
+    `利用率: ${utilizationPct}`,
+    `LTV 上限: ${lltvPct}`,
+    `健康因子: ${hfStr}`,
+    `借款 APY(估): ${toPctString(snap.borrowApy)} (APR ${toPctString(
+      snap.borrowApr
+    )})`,
+    "",
+    `风险评估: ${riskLevel}`,
+  ];
+
+  const telegramText = lines.join("\n");
+
+  await sendTelegramMessage(telegramText);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
