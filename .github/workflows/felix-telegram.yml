@@ -1,11 +1,9 @@
 name: Felix Position Telegram Monitor
 
 on:
-  # GitHub Actions 使用 UTC 时间
-  # 0,4,8,12,16,20 点 UTC ~= 北京时间 8,12,16,20,0,4 点
+  # 使用 UTC，提前约 40 分钟触发（20 分）对冲延迟
   schedule:
-    - cron: "0 0,4,8,12,16,20 * * *"
-  # 方便你手动在 Actions 页面点一次测试
+    - cron: "20 3,7,11,15,19,23 * * *"
   workflow_dispatch:
 
 jobs:
@@ -20,6 +18,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
 
       - name: Install dependencies
         run: npm install
