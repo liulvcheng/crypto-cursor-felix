@@ -1,233 +1,207 @@
-// Felix 借贷仓位监控脚本（HyperEVM / Felix / Morpho Blue 风格）
-// 目标输出：
-// - 抵押品价值（USDH 计价，≈ USD）
-// - 借款价值（USDH）
-// - 借款 APY（由 IRM.borrowRateView 计算）
-//
-// 你已提供的关键规则：
-// - Oracle: `price()` 返回 “1 collateral asset 以 loan asset 报价” 的价格，按 1e36 缩放。
-//   => collateralValueInLoanAssets = collateralAssets * price / 1e36
-// - IRM: `borrowRateView(marketParams, market)` 返回借款利率。
-//
-// 注意：
-// - 这个脚本只做只读查询，不需要私钥。
-// - 价格与金额全部使用链上合约数据计算，不依赖网页抓包。
+import { Contract, JsonRpcProvider, formatUnits, getAddress, isAddress } from "ethers";
 
-import { JsonRpcProvider, Contract, formatUnits } from "ethers";
-import fetch from "node-fetch";
+// 默认直接监控当前这条 Felix 池子；需要切池子时优先改环境变量。
+const DEFAULT_CONFIG = Object.freeze({
+  userAddress: "0xc69eC94F3dcE57B622D790E773899bc1d11A8074",
+  rpcUrl: "https://rpc.hyperliquid.xyz/evm",
+  marketAddress: "0x68e37de8d93d3496ae143f2e900490f6280c57cd",
+  poolId: "0x85e7ea4f16f2299a2e50a650164c4ca3a01d4892c66950e4c9c7863dc79e9ea4",
+  expectedMarketParams: Object.freeze({
+    loanToken: "0x111111a1a0667d36bD57c0A9f569b98057111111",
+    collateralToken: "0x5555555555555555555555555555555555555555",
+    oracle: "0x72f82357dc9916ef419fAe30eaE44b0899668474",
+    irm: "0xD4a426F010986dCad727e8dd6eed44cA4A9b7483",
+  }),
+});
 
-// =============== 1) 固定配置（你这条池子已确认） ===============
-
-const USER_ADDRESS = "0xc69eC94F3dcE57B622D790E773899bc1d11A8074";
-const HYPER_EVM_RPC = "https://rpc.hyperliquid.xyz/evm";
-
-// Felix/Morpho Blue 风格的主市场合约（包含 position/market/idToMarketParams）
-const FELIX_MARKET = "0x68e37de8d93d3496ae143f2e900490f6280c57cd";
-
-// 这条池子的 id（bytes32）
-const FELIX_POOL_ID =
-  "0x85e7ea4f16f2299a2e50a650164c4ca3a01d4892c66950e4c9c7863dc79e9ea4";
-
-// 你已查到的 MarketParams（用于做 sanity check，也用于解释输出）
-const USDH_TOKEN = "0x111111a1a0667d36bD57c0A9f569b98057111111"; // loanToken
-const HYPE_TOKEN = "0x5555555555555555555555555555555555555555"; // collateralToken
-const ORACLE = "0x72f82357dc9916ef419fAe30eaE44b0899668474";
-const IRM = "0xD4a426F010986dCad727e8dd6eed44cA4A9b7483";
-
-// 常量
 const ORACLE_SCALE = 10n ** 36n;
 const WAD = 10n ** 18n;
 const SECONDS_PER_YEAR = 31_536_000n;
-
-// =============== 2) 最小 ABI（只保留脚本用到的函数） ===============
+const TELEGRAM_TIMEOUT_MS = 10_000;
 
 const ERC20_ABI = [
-  {
-    inputs: [],
-    name: "decimals",
-    outputs: [{ internalType: "uint8", name: "", type: "uint8" }],
-    stateMutability: "view",
-    type: "function",
-  },
-  {
-    inputs: [],
-    name: "symbol",
-    outputs: [{ internalType: "string", name: "", type: "string" }],
-    stateMutability: "view",
-    type: "function",
-  },
+  "function decimals() view returns (uint8)",
+  "function symbol() view returns (string)",
 ];
 
-// IOracle.sol：price() -> uint256（scaled 1e36）
 const ORACLE_ABI = [
-  {
-    inputs: [],
-    name: "price",
-    outputs: [{ internalType: "uint256", name: "", type: "uint256" }],
-    stateMutability: "view",
-    type: "function",
-  },
+  "function price() view returns (uint256)",
 ];
 
-// Morpho/Felix 市场合约（你给的 0x68e3... 里就有这些函数）
 const MARKET_ABI = [
-  {
-    inputs: [{ internalType: "Id", name: "", type: "bytes32" }],
-    name: "idToMarketParams",
-    outputs: [
-      { internalType: "address", name: "loanToken", type: "address" },
-      { internalType: "address", name: "collateralToken", type: "address" },
-      { internalType: "address", name: "oracle", type: "address" },
-      { internalType: "address", name: "irm", type: "address" },
-      { internalType: "uint256", name: "lltv", type: "uint256" },
-    ],
-    stateMutability: "view",
-    type: "function",
-  },
-  {
-    inputs: [{ internalType: "Id", name: "", type: "bytes32" }],
-    name: "market",
-    outputs: [
-      { internalType: "uint128", name: "totalSupplyAssets", type: "uint128" },
-      { internalType: "uint128", name: "totalSupplyShares", type: "uint128" },
-      { internalType: "uint128", name: "totalBorrowAssets", type: "uint128" },
-      { internalType: "uint128", name: "totalBorrowShares", type: "uint128" },
-      { internalType: "uint128", name: "lastUpdate", type: "uint128" },
-      { internalType: "uint128", name: "fee", type: "uint128" },
-    ],
-    stateMutability: "view",
-    type: "function",
-  },
-  {
-    inputs: [
-      { internalType: "Id", name: "", type: "bytes32" },
-      { internalType: "address", name: "", type: "address" },
-    ],
-    name: "position",
-    outputs: [
-      { internalType: "uint256", name: "supplyShares", type: "uint256" },
-      { internalType: "uint128", name: "borrowShares", type: "uint128" },
-      { internalType: "uint128", name: "collateral", type: "uint128" },
-    ],
-    stateMutability: "view",
-    type: "function",
-  },
+  "function idToMarketParams(bytes32) view returns (address loanToken, address collateralToken, address oracle, address irm, uint256 lltv)",
+  "function market(bytes32) view returns (uint128 totalSupplyAssets, uint128 totalSupplyShares, uint128 totalBorrowAssets, uint128 totalBorrowShares, uint128 lastUpdate, uint128 fee)",
+  "function position(bytes32, address) view returns (uint256 supplyShares, uint128 borrowShares, uint128 collateral)",
 ];
 
-// 你提供的 IRM ABI：borrowRateView(marketParams, market) -> uint256
 const IRM_ABI = [
-  {
-    inputs: [
-      {
-        components: [
-          { internalType: "address", name: "loanToken", type: "address" },
-          { internalType: "address", name: "collateralToken", type: "address" },
-          { internalType: "address", name: "oracle", type: "address" },
-          { internalType: "address", name: "irm", type: "address" },
-          { internalType: "uint256", name: "lltv", type: "uint256" },
-        ],
-        internalType: "struct MarketParams",
-        name: "marketParams",
-        type: "tuple",
-      },
-      {
-        components: [
-          { internalType: "uint128", name: "totalSupplyAssets", type: "uint128" },
-          { internalType: "uint128", name: "totalSupplyShares", type: "uint128" },
-          { internalType: "uint128", name: "totalBorrowAssets", type: "uint128" },
-          { internalType: "uint128", name: "totalBorrowShares", type: "uint128" },
-          { internalType: "uint128", name: "lastUpdate", type: "uint128" },
-          { internalType: "uint128", name: "fee", type: "uint128" },
-        ],
-        internalType: "struct Market",
-        name: "market",
-        type: "tuple",
-      },
-    ],
-    name: "borrowRateView",
-    outputs: [{ internalType: "uint256", name: "", type: "uint256" }],
-    stateMutability: "view",
-    type: "function",
-  },
+  "function borrowRateView((address loanToken, address collateralToken, address oracle, address irm, uint256 lltv) marketParams, (uint128 totalSupplyAssets, uint128 totalSupplyShares, uint128 totalBorrowAssets, uint128 totalBorrowShares, uint128 lastUpdate, uint128 fee) market) view returns (uint256)",
 ];
 
-// =============== 3) BigInt 小工具 ===============
+function normalizeAddress(value, label) {
+  if (!value || !isAddress(value)) {
+    throw new Error(`Invalid ${label}: ${value ?? "<empty>"}`);
+  }
 
-function mulDivDown(a, b, den) {
-  if (den === 0n) throw new Error("mulDivDown: division by zero");
-  return (a * b) / den;
+  return getAddress(value);
 }
 
-function toPctString(x, decimals = 2) {
-  // x: 例如 0.1234 => "12.34%"
-  if (!Number.isFinite(x)) return "N/A";
-  return `${(x * 100).toFixed(decimals)}%`;
+function normalizeBytes32(value, label) {
+  if (!/^0x[0-9a-fA-F]{64}$/.test(value ?? "")) {
+    throw new Error(`Invalid ${label}: ${value ?? "<empty>"}`);
+  }
+
+  return value.toLowerCase();
 }
 
-// =============== 4) 核心读取与计算 ===============
+function readOptionalEnv(env, key) {
+  return env[key]?.trim() || "";
+}
 
-async function fetchPositionSnapshot(provider) {
-  const market = new Contract(FELIX_MARKET, MARKET_ABI, provider);
-  const oracle = new Contract(ORACLE, ORACLE_ABI, provider);
-  const irm = new Contract(IRM, IRM_ABI, provider);
+function loadConfig(env = process.env) {
+  return {
+    userAddress: normalizeAddress(env.USER_ADDRESS || DEFAULT_CONFIG.userAddress, "USER_ADDRESS"),
+    rpcUrl: readOptionalEnv(env, "HYPER_EVM_RPC") || DEFAULT_CONFIG.rpcUrl,
+    marketAddress: normalizeAddress(
+      env.FELIX_MARKET || DEFAULT_CONFIG.marketAddress,
+      "FELIX_MARKET"
+    ),
+    poolId: normalizeBytes32(env.FELIX_POOL_ID || DEFAULT_CONFIG.poolId, "FELIX_POOL_ID"),
+    expectedMarketParams: {
+      loanToken: normalizeAddress(
+        env.USDH_TOKEN || DEFAULT_CONFIG.expectedMarketParams.loanToken,
+        "USDH_TOKEN"
+      ),
+      collateralToken: normalizeAddress(
+        env.HYPE_TOKEN || DEFAULT_CONFIG.expectedMarketParams.collateralToken,
+        "HYPE_TOKEN"
+      ),
+      oracle: normalizeAddress(
+        env.ORACLE || DEFAULT_CONFIG.expectedMarketParams.oracle,
+        "ORACLE"
+      ),
+      irm: normalizeAddress(env.IRM || DEFAULT_CONFIG.expectedMarketParams.irm, "IRM"),
+    },
+    telegram: {
+      botToken: readOptionalEnv(env, "TELEGRAM_BOT_TOKEN"),
+      chatId: readOptionalEnv(env, "TELEGRAM_CHAT_ID"),
+    },
+  };
+}
 
-  // 1) 读取 MarketParams / Market / Position
-  const [marketParams, marketData, pos] = await Promise.all([
-    market.idToMarketParams(FELIX_POOL_ID),
-    market.market(FELIX_POOL_ID),
-    market.position(FELIX_POOL_ID, USER_ADDRESS),
-  ]);
+function mulDivDown(a, b, denominator) {
+  if (denominator === 0n) {
+    throw new Error("mulDivDown: division by zero");
+  }
 
-  // 2) sanity check：确保你监控的就是这条池子
-  // （如果 Felix 升级/换池子，这里会提醒你）
-  const mismatches = [];
-  if (marketParams.loanToken.toLowerCase() !== USDH_TOKEN.toLowerCase()) mismatches.push("loanToken");
-  if (marketParams.collateralToken.toLowerCase() !== HYPE_TOKEN.toLowerCase()) mismatches.push("collateralToken");
-  if (marketParams.oracle.toLowerCase() !== ORACLE.toLowerCase()) mismatches.push("oracle");
-  if (marketParams.irm.toLowerCase() !== IRM.toLowerCase()) mismatches.push("irm");
+  return (a * b) / denominator;
+}
 
-  // 3) token 元信息（仅用于展示）
-  const loanErc20 = new Contract(marketParams.loanToken, ERC20_ABI, provider);
-  const collatErc20 = new Contract(marketParams.collateralToken, ERC20_ABI, provider);
-  const [[loanSymbol, loanDecimals], [collatSymbol, collatDecimals]] = await Promise.all([
-    Promise.all([loanErc20.symbol(), loanErc20.decimals()]),
-    Promise.all([collatErc20.symbol(), collatErc20.decimals()]),
-  ]);
+function toPercentString(value, digits = 2) {
+  if (!Number.isFinite(value)) {
+    return "N/A";
+  }
 
-  // 4) 借款资产：borrowShares -> borrowAssets
-  // 近似按“按比例”换算：borrowAssets ~= borrowShares * totalBorrowAssets / totalBorrowShares
-  const borrowShares = pos.borrowShares; // bigint (v6)
-  const totalBorrowAssets = marketData.totalBorrowAssets;
-  const totalBorrowShares = marketData.totalBorrowShares;
+  return `${(value * 100).toFixed(digits)}%`;
+}
 
-  const borrowAssets =
-    totalBorrowShares === 0n ? 0n : mulDivDown(borrowShares, totalBorrowAssets, totalBorrowShares);
+function formatTokenAmount(value, decimals, digits = 4) {
+  const numericValue = Number.parseFloat(formatUnits(value, decimals));
 
-  // 5) 抵押资产（collateral token 的最小单位）
-  const collateralAssets = pos.collateral;
+  return Number.isFinite(numericValue)
+    ? numericValue.toLocaleString("en-US", {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: digits,
+      })
+    : formatUnits(value, decimals);
+}
 
-  // 6) Oracle 价格：collateral -> loan 计价（scaled 1e36）
-  const price = await oracle.price(); // bigint
-  const collateralValueInLoanAssets = mulDivDown(collateralAssets, price, ORACLE_SCALE);
+function formatUsdValue(rawAmount, decimals, digits = 2) {
+  const numericValue = Number.parseFloat(formatUnits(rawAmount, decimals));
 
-  // 7) 健康因子（用 lltv 推 maxBorrow，注意：不是清算线，仅是 lltv 上限）
-  const lltv = marketParams.lltv; // 例如 0.77e18
-  const maxBorrowAssets = mulDivDown(collateralValueInLoanAssets, lltv, WAD);
-  const healthFactor = borrowAssets === 0n ? Infinity : Number((maxBorrowAssets * 1_0000n) / borrowAssets) / 1_0000;
+  return Number.isFinite(numericValue)
+    ? numericValue.toLocaleString("en-US", {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: digits,
+      })
+    : formatUnits(rawAmount, decimals);
+}
 
-  // 8) 借款利率：IRM.borrowRateView
-  // 这里按 Morpho Blue 常见约定，把 borrowRateView 当作 “每秒利率（WAD=1e18）”
-  // 年化 APR = ratePerSecondWad * secondsPerYear / 1e18
-  // ethers v6 返回的结构是只读 Result，需要显式转换成普通数组 tuple 再传给 IRM
-  const marketParamsTuple = [
+function shortAddress(address) {
+  return `${address.slice(0, 6)}...${address.slice(-4)}`;
+}
+
+function getHealthFactor(maxBorrowAssets, borrowAssets) {
+  if (borrowAssets === 0n) {
+    return Infinity;
+  }
+
+  return Number((maxBorrowAssets * 10_000n) / borrowAssets) / 10_000;
+}
+
+function getRiskAssessment(utilization, healthFactor) {
+  if (
+    utilization > 0.75 ||
+    (Number.isFinite(healthFactor) && healthFactor < 1.3)
+  ) {
+    return "⚠️ 风险偏高，建议减仓或补充抵押";
+  }
+
+  if (
+    utilization > 0.6 ||
+    (Number.isFinite(healthFactor) && healthFactor < 1.6)
+  ) {
+    return "🟡 风险中等，注意价格波动";
+  }
+
+  return "✅ 风险较低";
+}
+
+function findMarketParamMismatches(actual, expected) {
+  const fields = [
+    ["loanToken", actual.loanToken, expected.loanToken],
+    ["collateralToken", actual.collateralToken, expected.collateralToken],
+    ["oracle", actual.oracle, expected.oracle],
+    ["irm", actual.irm, expected.irm],
+  ];
+
+  return fields
+    .filter(([, currentValue, expectedValue]) => currentValue !== expectedValue)
+    .map(([field, currentValue, expectedValue]) => ({
+      field,
+      currentValue,
+      expectedValue,
+    }));
+}
+
+async function fetchTokenMetadata(tokenAddress, provider) {
+  const token = new Contract(tokenAddress, ERC20_ABI, provider);
+
+  try {
+    const [symbol, decimals] = await Promise.all([token.symbol(), token.decimals()]);
+
+    return { symbol, decimals };
+  } catch {
+    // 有些代币合约不一定完整实现 symbol/decimals，展示时退化成地址缩写。
+    return {
+      symbol: shortAddress(tokenAddress),
+      decimals: 18,
+    };
+  }
+}
+
+function buildMarketParamsTuple(marketParams) {
+  return [
     marketParams.loanToken,
     marketParams.collateralToken,
     marketParams.oracle,
     marketParams.irm,
     marketParams.lltv,
   ];
+}
 
-  const marketDataTuple = [
+function buildMarketTuple(marketData) {
+  return [
     marketData.totalSupplyAssets,
     marketData.totalSupplyShares,
     marketData.totalBorrowAssets,
@@ -235,164 +209,235 @@ async function fetchPositionSnapshot(provider) {
     marketData.lastUpdate,
     marketData.fee,
   ];
+}
 
-  const ratePerSecondWad = await irm.borrowRateView(marketParamsTuple, marketDataTuple); // bigint
-  const aprWad = mulDivDown(ratePerSecondWad, SECONDS_PER_YEAR, 1n); // 仍是 WAD 精度
-  const apr = parseFloat(formatUnits(aprWad, 18)); // e.g. 0.05
-  const apy = Math.pow(1 + apr / 365, 365) - 1;
+async function fetchPositionSnapshot(provider, config) {
+  const market = new Contract(config.marketAddress, MARKET_ABI, provider);
 
-  // 9) 展示用字符串（USDH ≈ USD）
-  const collateralAmountStr = formatUnits(collateralAssets, collatDecimals);
-  const debtAmountStr = formatUnits(borrowAssets, loanDecimals);
-  const collateralUsdStr = formatUnits(collateralValueInLoanAssets, loanDecimals);
-  const debtUsdStr = debtAmountStr;
+  // Felix 的核心输入都来自 market 合约：池子参数、池子状态、用户仓位。
+  const [marketParams, marketData, position] = await Promise.all([
+    market.idToMarketParams(config.poolId),
+    market.market(config.poolId),
+    market.position(config.poolId, config.userAddress),
+  ]);
 
-  const collateralUsd = parseFloat(collateralUsdStr || "0");
-  const debtUsd = parseFloat(debtUsdStr || "0");
+  const normalizedMarketParams = {
+    loanToken: getAddress(marketParams.loanToken),
+    collateralToken: getAddress(marketParams.collateralToken),
+    oracle: getAddress(marketParams.oracle),
+    irm: getAddress(marketParams.irm),
+    lltv: marketParams.lltv,
+  };
+
+  const mismatches = findMarketParamMismatches(
+    normalizedMarketParams,
+    config.expectedMarketParams
+  );
+
+  const loanToken = fetchTokenMetadata(normalizedMarketParams.loanToken, provider);
+  const collateralToken = fetchTokenMetadata(
+    normalizedMarketParams.collateralToken,
+    provider
+  );
+  const oracle = new Contract(normalizedMarketParams.oracle, ORACLE_ABI, provider);
+  const irm = new Contract(normalizedMarketParams.irm, IRM_ABI, provider);
+
+  const [loanMetadata, collateralMetadata, price, ratePerSecondWad] = await Promise.all([
+    loanToken,
+    collateralToken,
+    oracle.price(),
+    irm.borrowRateView(
+      buildMarketParamsTuple(normalizedMarketParams),
+      buildMarketTuple(marketData)
+    ),
+  ]);
+
+  const borrowAssets =
+    marketData.totalBorrowShares === 0n
+      ? 0n
+      : mulDivDown(
+          position.borrowShares,
+          marketData.totalBorrowAssets,
+          marketData.totalBorrowShares
+        );
+  const collateralAssets = position.collateral;
+  // oracle.price() 的含义是 “1 collateral = 多少 loan”，精度是 1e36。
+  const collateralValueInLoanAssets = mulDivDown(
+    collateralAssets,
+    price,
+    ORACLE_SCALE
+  );
+  // lltv 是协议允许的最大借款比例，WAD 精度是 1e18。
+  const maxBorrowAssets = mulDivDown(
+    collateralValueInLoanAssets,
+    normalizedMarketParams.lltv,
+    WAD
+  );
+  const healthFactor = getHealthFactor(maxBorrowAssets, borrowAssets);
+
+  // borrowRateView 返回秒级利率，按 1e18 缩放，这里再换成年化。
+  const apr = Number.parseFloat(
+    formatUnits(ratePerSecondWad * SECONDS_PER_YEAR, 18)
+  );
+  const apy = Number.isFinite(apr) ? Math.pow(1 + apr / 365, 365) - 1 : NaN;
+  const collateralUsd = Number.parseFloat(
+    formatUnits(collateralValueInLoanAssets, loanMetadata.decimals)
+  );
+  const debtUsd = Number.parseFloat(formatUnits(borrowAssets, loanMetadata.decimals));
   const utilization = collateralUsd > 0 ? debtUsd / collateralUsd : 0;
 
   return {
     mismatches,
-    loanSymbol,
-    collatSymbol,
-    collateralAmountStr,
-    debtAmountStr,
-    collateralUsdStr,
-    debtUsdStr,
+    marketParams: normalizedMarketParams,
+    loanMetadata,
+    collateralMetadata,
+    collateralAssets,
+    borrowAssets,
+    collateralValueInLoanAssets,
     utilization,
     healthFactor,
-    lltv,
     borrowApr: apr,
     borrowApy: apy,
+    riskLevel: getRiskAssessment(utilization, healthFactor),
   };
 }
 
-// =============== 5) Telegram 消息发送工具 ===============
+function buildConsoleLines(snapshot, config, now, blockNumber) {
+  const healthFactor = Number.isFinite(snapshot.healthFactor)
+    ? snapshot.healthFactor.toFixed(4)
+    : "∞";
 
-async function sendTelegramMessage(text) {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_CHAT_ID;
+  return [
+    `[INFO ] ${now} - Felix / HyperEVM 仓位监控脚本启动`,
+    `[INFO ] ${now} - 使用 RPC: ${config.rpcUrl}`,
+    `[INFO ] ${now} - 钱包地址: ${config.userAddress}`,
+    `[INFO ] ${now} - Pool ID : ${config.poolId.slice(0, 12)}...`,
+    `[INFO ] ${now} - 已连接到 HyperEVM，当前区块高度: ${blockNumber.toString()}`,
+    "",
+    "==============================================",
+    " Felix / HyperEVM 抵押借款仓位监控结果",
+    "==============================================",
+    ` 抵押品数量       : ${formatTokenAmount(snapshot.collateralAssets, snapshot.collateralMetadata.decimals)} ${snapshot.collateralMetadata.symbol}`,
+    ` 抵押品总价值 USD : $${formatUsdValue(snapshot.collateralValueInLoanAssets, snapshot.loanMetadata.decimals)}`,
+    ` 借款总价值 USD   : $${formatUsdValue(snapshot.borrowAssets, snapshot.loanMetadata.decimals)}`,
+    ` 仓位利用率       : ${toPercentString(snapshot.utilization)}`,
+    ` LTV（协议上限）  : ${toPercentString(Number(snapshot.marketParams.lltv) / 1e18)}`,
+    ` 健康因子         : ${healthFactor}`,
+    ` 借款 APY (估算)  : ${toPercentString(snapshot.borrowApy)}  (APR ${toPercentString(snapshot.borrowApr)})`,
+    "----------------------------------------------",
+    ` 风险评估         : ${snapshot.riskLevel}`,
+    "==============================================",
+  ];
+}
 
-  if (!token || !chatId) {
+function buildTelegramMessage(snapshot, config, now) {
+  const healthFactor = Number.isFinite(snapshot.healthFactor)
+    ? snapshot.healthFactor.toFixed(4)
+    : "∞";
+
+  return [
+    "Felix / HyperEVM 抵押借款仓位监控",
+    "",
+    `时间: ${now}`,
+    `钱包: ${shortAddress(config.userAddress)}`,
+    `池子: ${config.poolId.slice(0, 10)}...`,
+    "",
+    `抵押品: ${formatTokenAmount(snapshot.collateralAssets, snapshot.collateralMetadata.decimals)} ${snapshot.collateralMetadata.symbol} ($${formatUsdValue(snapshot.collateralValueInLoanAssets, snapshot.loanMetadata.decimals)})`,
+    `借款: $${formatUsdValue(snapshot.borrowAssets, snapshot.loanMetadata.decimals)} ${snapshot.loanMetadata.symbol}`,
+    `利用率: ${toPercentString(snapshot.utilization)}`,
+    `LTV 上限: ${toPercentString(Number(snapshot.marketParams.lltv) / 1e18)}`,
+    `健康因子: ${healthFactor}`,
+    `借款 APY(估): ${toPercentString(snapshot.borrowApy)} (APR ${toPercentString(snapshot.borrowApr)})`,
+    `风险评估: ${snapshot.riskLevel}`,
+  ].join("\n");
+}
+
+async function sendTelegramMessage(text, telegramConfig) {
+  if (!telegramConfig.botToken || !telegramConfig.chatId) {
     console.warn(
       "[WARN ] 未配置 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID，跳过 Telegram 推送"
     );
     return;
   }
 
-  const url = `https://api.telegram.org/bot${token}/sendMessage`;
-
-  const body = {
-    chat_id: chatId,
-    text,
-    parse_mode: "Markdown",
-  };
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    console.warn(
-      `[WARN ] Telegram 发送失败: ${res.status} ${res.statusText} ${text}`
-    );
-  } else {
-    console.log("[INFO ] 已发送监控结果到 Telegram");
+  if (typeof fetch !== "function") {
+    throw new Error("Global fetch is unavailable. Please use Node.js 18 or newer.");
   }
+
+  const response = await fetch(
+    `https://api.telegram.org/bot${telegramConfig.botToken}/sendMessage`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        chat_id: telegramConfig.chatId,
+        text,
+      }),
+      signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
+    }
+  );
+
+  if (!response.ok) {
+    const responseBody = await response.text().catch(() => "");
+    console.warn(
+      `[WARN ] Telegram 发送失败: ${response.status} ${response.statusText} ${responseBody}`
+    );
+    return;
+  }
+
+  console.log("[INFO ] 已发送监控结果到 Telegram");
 }
 
-// =============== 6) main：美化终端输出 + Telegram 推送 ===============
-
 async function main() {
-  const provider = new JsonRpcProvider(HYPER_EVM_RPC);
-  const blockNumber = await provider.getBlockNumber();
-  const now = new Date().toISOString();
+  const config = loadConfig();
+  const provider = new JsonRpcProvider(config.rpcUrl);
 
-  const snap = await fetchPositionSnapshot(provider);
+  try {
+    const [blockNumber, snapshot] = await Promise.all([
+      provider.getBlockNumber(),
+      fetchPositionSnapshot(provider, config),
+    ]);
+    const now = new Date().toISOString();
 
-  if (snap.mismatches.length) {
-    console.log(`WARN: MarketParams mismatch: ${snap.mismatches.join(", ")} (池子可能变更/升级了)`);
+    if (snapshot.mismatches.length > 0) {
+      // 这里只告警不退出，避免 Felix 升级地址后监控直接中断。
+      for (const mismatch of snapshot.mismatches) {
+        console.warn(
+          `[WARN ] MarketParams mismatch for ${mismatch.field}: expected ${mismatch.expectedValue}, got ${mismatch.currentValue}`
+        );
+      }
+    }
+
+    for (const line of buildConsoleLines(snapshot, config, now, blockNumber)) {
+      console.log(line);
+    }
+
+    await sendTelegramMessage(
+      buildTelegramMessage(snapshot, config, now),
+      config.telegram
+    );
+  } finally {
+    provider.destroy();
   }
-
-  const utilizationPct = toPctString(snap.utilization);
-  const lltvPct = toPctString(Number(snap.lltv) / 1e18);
-  const hfStr = Number.isFinite(snap.healthFactor) ? snap.healthFactor.toFixed(4) : "∞";
-
-  // 简单风险评估（仅做主观参考）
-  let riskLevel = "✅ 风险较低";
-  if (snap.utilization > 0.75 || (Number.isFinite(snap.healthFactor) && snap.healthFactor < 1.3)) {
-    riskLevel = "⚠️ 风险偏高，建议减仓或补充抵押";
-  } else if (snap.utilization > 0.6 || (Number.isFinite(snap.healthFactor) && snap.healthFactor < 1.6)) {
-    riskLevel = "🟡 风险中等，注意价格波动";
-  }
-
-  // 终端输出
-  console.log(`[INFO ] ${now} - Felix / HyperEVM 仓位监控脚本启动`);
-  console.log(`[INFO ] ${now} - 使用 RPC: ${HYPER_EVM_RPC}`);
-  console.log(`[INFO ] ${now} - 钱包地址: ${USER_ADDRESS}`);
-  console.log(`[INFO ] ${now} - Pool ID : ${FELIX_POOL_ID.slice(0, 12)}...`);
-  console.log(
-    `[INFO ] ${now} - 已连接到 HyperEVM，当前区块高度: ${blockNumber.toString()}`
-  );
-
-  console.log("");
-  console.log("==============================================");
-  console.log(" Felix / HyperEVM 抵押借款仓位监控结果");
-  console.log("==============================================");
-  console.log(` 抵押品数量       : ${snap.collateralAmountStr} ${snap.collatSymbol}`);
-  console.log(` 抵押品总价值 USD : $${snap.collateralUsdStr}`);
-  console.log(` 借款总价值 USD   : $${snap.debtUsdStr}`);
-  console.log(` 仓位利用率       : ${utilizationPct}`);
-  console.log(` LTV（协议上限）  : ${lltvPct}`);
-  console.log(` 健康因子         : ${hfStr}`);
-  console.log(
-    ` 借款 APY (估算)  : ${toPctString(snap.borrowApy)}  (APR ${toPctString(
-      snap.borrowApr
-    )})`
-  );
-  console.log("----------------------------------------------");
-  console.log(` 风险评估         : ${riskLevel}`);
-  console.log("==============================================");
-
-  // Telegram 文本（简洁版，多行）
-  const shortAddress =
-    USER_ADDRESS.slice(0, 6) + "..." + USER_ADDRESS.slice(-4);
-
-  const lines = [
-    "*Felix / HyperEVM 抵押借款仓位监控*",
-    "",
-    `时间: \`${now}\``,
-    `钱包: \`${shortAddress}\``,
-    "",
-    `抵押品: ${snap.collateralAmountStr} ${snap.collatSymbol} ($${snap.collateralUsdStr})`,
-    `借款:   $${snap.debtUsdStr} ${snap.loanSymbol}`,
-    "",
-    `利用率: ${utilizationPct}`,
-    `LTV 上限: ${lltvPct}`,
-    `健康因子: ${hfStr}`,
-    `借款 APY(估): ${toPctString(snap.borrowApy)} (APR ${toPctString(
-      snap.borrowApr
-    )})`,
-    "",
-    `风险评估: ${riskLevel}`,
-  ];
-
-  const telegramText = lines.join("\n");
-
-  await sendTelegramMessage(telegramText);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  main().catch((err) => {
-    console.error(err?.message || String(err));
+  main().catch((error) => {
+    console.error(error?.message || String(error));
     process.exit(1);
   });
 }
 
-export { main };
-
+export {
+  buildConsoleLines,
+  buildTelegramMessage,
+  fetchPositionSnapshot,
+  getHealthFactor,
+  getRiskAssessment,
+  loadConfig,
+  main,
+  normalizeBytes32,
+  toPercentString,
+};

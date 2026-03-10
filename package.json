@@ -1,17 +1,23 @@
 {
   "name": "crypto-felix",
   "version": "1.0.0",
-  "description": "",
+  "description": "Monitor a Felix borrowing position on HyperEVM and optionally push alerts to Telegram.",
   "main": "monitor-felix.js",
   "scripts": {
-    "start": "node monitor-felix.js"
+    "check": "node --check monitor-felix.js",
+    "start": "node monitor-felix.js",
+    "test": "node --test"
   },
   "type": "module",
-  "keywords": [],
+  "keywords": [
+    "felix",
+    "hyperevm",
+    "monitor",
+    "telegram"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "ethers": "^6.16.0",
-    "node-fetch": "^3.3.2"
+    "ethers": "^6.16.0"
   }
 }
